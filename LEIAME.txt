@@ -1,0 +1,58 @@
+______           _   ______                   
+|  _  \         | |  |  ___|                  
+| | | |__ _ _ __| | _| |_ __ _ _ __ _ __ ___  
+| | | / _` | '__| |/ /  _/ _` | '__| '_ ` _ \ 
+| |/ / (_| | |  |   <| || (_| | |  | | | | | |
+|___/ \__,_|_|  |_|\_\_| \__,_|_|  |_| |_| |_|
+                                              
+                                              
+Random Group Gate
+==================
+
+Dispositivo Max for Live que muta/desmuta aleatoriamente as faixas dentro
+de um Grupo, em um ritmo sincronizado com o tempo do projeto.
+
+ARQUIVOS NECESSÁRIOS
+---------------------
+- Random group gate.amxd
+- randomgroup.js
+
+Os dois arquivos precisam ficar SEMPRE na mesma pasta. O .amxd sozinho
+não funciona: ele carrega a lógica a partir do randomgroup.js pelo nome
+do arquivo. Se for compartilhar, zipe os dois juntos.
+
+REQUISITOS
+----------
+- Ableton Live com Max for Live (Suite ou o add-on).
+
+INSTALAÇÃO
+----------
+1. Coloque as duas pastas/arquivos juntos em algum lugar que o navegador
+   do Live enxergue (ex: Documents/Max 8/Library, ou uma pasta adicionada
+   em Places no Live).
+
+COMO USAR
+---------
+- Rate: escolhe a frequência dos sorteios (1/32 até 2 bars), sincronizado
+  ao tempo/compasso do projeto.
+- On/Off: liga/desliga o sorteio automático. Já começa ligado, e também
+  pausa sozinho quando o transporte do Live não está tocando.
+- refresh: clique depois de adicionar/remover faixas do grupo, para o
+  dispositivo re-escanear quais faixas ele controla (até 8).
+- autobalance: divide 0-100 igualmente entre as faixas reais encontradas
+  no grupo. Roda automaticamente ao carregar o dispositivo também.
+- Min/Max por canal: cada canal (1-8) liga quando o número sorteado (0-100)
+  cai dentro do seu intervalo. Intervalos podem se sobrepor para permitir
+  mais de um canal ligado ao mesmo tempo.
+- Last Roll: mostra o último número sorteado.
+
+Rate e On/Off podem ser automatizados/mapeados como parâmetros normais
+do Live (clique direito no controle no Max > Inspector > Parameter, se
+quiser reconfigurar).
+
+PROBLEMAS COMUNS
+-----------------
+- Nada acontece: confirme que o dispositivo está na faixa de Grupo (não
+  dentro dele) e clique em "refresh".
+
+by Dig
