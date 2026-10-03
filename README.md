@@ -1,8 +1,8 @@
 # Random Group Gate
 
 A Max for Live Audio Effect device. Sits on a Group track in Ableton Live and
-randomly mutes/unmutes the tracks inside that group, on a tempo-synced clock,
-based on per-channel 0-100 ranges.
+randomly gates the tracks inside that group, tempo-synced, by riding each
+track's volume fader with an attack/release envelope.
 
 ## Files
 
@@ -17,32 +17,46 @@ based on per-channel 0-100 ranges.
 
 - Up to 8 channels, each mapped to a track inside the group (by position,
   top to bottom).
-- On a tempo-synced clock (1/32 note up to 2 bars, selectable), rolls a
-  random number 0-100.
-- Each channel has a Min/Max range (0-100). If the roll falls inside a
-  channel's range, that channel's track unmutes; otherwise it mutes.
-  Overlapping ranges let multiple channels be on at once.
-- Auto Balance: splits 0-100 evenly across however many real tracks are
-  currently in the group (runs automatically on load/refresh, or manually
-  via the `autobalance` message box).
-- On/Off toggle: defaults on, and automatically pauses the clock when
-  Live's transport isn't playing (resumes when it starts again).
-- Rate and On/Off are both exposed as Live-automatable parameters.
+- Rolls a random number 0-100. Every channel whose Min/Max range contains
+  the roll wins and opens for its own **Length** (1/32 ... 4 bars). The
+  next roll happens when the longest winner has finished. If nothing wins,
+  every channel stays closed for the **Rest** length.
+  Overlapping ranges still let several channels open together. A 0-0 range
+  disables a channel.
+- Gating is done on each track's **volume fader** through `live.remote~`,
+  with a global **Attack** / **Release** envelope (ms), between the
+  channel's **Level** (dB) and the global **Floor** (dB; -70 = -inf, a
+  higher Floor makes it a ducker instead of a gate). `live.remote~` does
+  not touch Live's Undo history. While the device is loaded those faders
+  are owned by the device (greyed out in the mixer); set levels with the
+  per-channel Level instead.
+- Timing is locked to Live's grid: the clock ticks every 32nd note and
+  reads Live's song position, so there is no drift, and loops/jumps simply
+  trigger a new roll.
+- Auto Balance: splits 0-100 evenly (no overlap) across however many real
+  tracks are in the group. Runs automatically only on a fresh device
+  (every range still 0-0); after that, ranges are saved with the set and
+  only change when you click `autobalance`.
+- On/Off toggle: defaults on. When it's off or Live's transport stops,
+  every channel opens back up to its Level.
+- **Every control is a Live parameter**: automatable, saved with the set
+  and presets, and mappable to Live's LFO / Envelope Follower / macros.
 
 ## Architecture (inside the patch)
 
 ```
-[live.thisdevice] --(bang on Live API ready)--> [refresh message] -> js inlet 2
-[toggle: On/Off]  --(int)--------------------------------------------> js inlet 0
-[umenu: Rate]     --(int 0-6)------------------------------------------> js inlet 1
-[autobalance message] ------------------------------------------------> js inlet 2
-[pak <16 ints>]   <- 16 number boxes (min/max x 8 channels) -----------> js inlet 2
-[metro] --(bang)--------------------------------------------------------> js inlet 0
+[live.thisdevice] --(bang on Live API ready)--> [refresh message] --> js
+[autobalance message] ------------------------------------------------> js
+[metro 32n @quantize 32n] --(bang every 32nd, only while playing)----> js
+every parameter --> [prepend setparam <name> <ch>] -------------------> js
+   (min/max/len/level x 8 channels; rest, onoff, attack, release, floor)
 
-js outlet 0  -> [metro] right inlet (sets ms period)
-js outlet 1  -> "Last Roll" number box (display)
-js outlets 2-9 -> 8 toggles (per-channel on/off indicator)
-js outlet 10 -> [metro] left inlet (actual run state = On/Off AND transport playing)
+js outlet 0      -> "Last Roll" number box (display)
+js outlets 1-8   -> 8 toggles (per-channel open indicator)
+js outlet 9      -> [metro] left inlet (On/Off)
+js outlets 10-17 -> [line~] per channel ("<fader value> <ms>")
+                      -> [live.remote~] left inlet (the envelope signal)
+js outlets 18-25 -> [live.remote~] RIGHT inlet ("id <track volume id>")
 
 [plugin~] <-> [plugout~]   (self-looped stereo pass-through; this device
                              does no audio processing, but an Audio Effect
@@ -55,11 +69,13 @@ All the real logic lives in `randomgroup.js`. The `.amxd` is mostly just UI
 
 ### Number boxes and Scripting Names
 
-The 16 min/max number boxes (and the Rate umenu, and the On/Off toggle) have
-Scripting Names (`varname`) set: `rgg_min1`/`rgg_max1` ... `rgg_min8`/`rgg_max8`,
-`rgg_rate`, `rgg_onoff`. `randomgroup.js` uses these to push values into the
-UI programmatically (auto-balance writing new ranges, syncing the Rate menu
-display, syncing the On/Off toggle on load) via:
+Every parameter object has a Scripting Name (`varname`): `rgg_min1..8`,
+`rgg_max1..8`, `rgg_len1..8`, `rgg_level1..8`, `rgg_rate` (the Rest menu;
+its Live parameter is still called `rate` so old automation keeps working),
+`rgg_onoff`, `rgg_attack`, `rgg_release`, `rgg_floor`. On `refresh` the
+script reads them all with `getvalueof()`, so it is in sync even after an
+autowatch reload. `randomgroup.js` uses these to push values into the
+UI programmatically (auto-balance writing new ranges) via:
 
 ```js
 var box = this.patcher.getnamed("rgg_min1");
@@ -91,19 +107,21 @@ of back-and-forth to figure out; don't reintroduce `messnamed()` for UI sync.
   the interval in ms itself, sending it to `[metro]`'s right inlet. This
   gives more control and was easier to get right than relying on Max's
   Time Value string parsing within a device.
-- **Track mute changes always pollute Live's Undo history**, and there is
-  no clean fix. `live.remote~` can control a parameter without touching
-  undo, but track `mute` is a plain Track property, not a LOM "Parameter"
-  object, so `live.remote~` can't target it. Confirmed via Cycling '74's
-  own forums — multiple people have asked, no real solution exists short of
-  restructuring every target track to live inside an Instrument/Audio
-  Effect Rack chain and controlling the chain's Macro instead (not
-  implemented here, probably not worth the structural cost).
-- **CPU**: `setMute()` caches one `LiveAPI` object per track (built once in
-  `collectChildren()`, not reconstructed every tick) and skips the
-  `LiveAPI.set()` call entirely if a channel's on/off state didn't change
-  from the previous roll. Don't reintroduce constructing `new LiveAPI(...)`
-  inside the per-tick roll loop.
+- **Track mute changes always pollute Live's Undo history** - that's why
+  the device no longer uses mute. Track volume *is* a LOM DeviceParameter,
+  so `live.remote~` can drive it without touching Undo. The one-time
+  "unmute tracks left muted by the old version" on refresh does make an
+  Undo entry, but only if a track was actually muted.
+- **`live.remote~` takes the `id` on its RIGHT inlet**; the left inlet is
+  the value (float or signal). Before binding, the script sets the
+  channel's `line~` to the right level first so the fader never dips to 0.
+- **dB values**: Live's fader (0.0-1.0, 0.85 = 0 dB) isn't linear in dB.
+  On refresh the script asks Live for `str_for_value` at 201 positions and
+  builds a lookup table, so device dB values match the mixer; it falls back
+  to an approximation if that fails (posts a message).
+- **CPU**: the script runs once per 32nd note but only does real work
+  (outlets to `line~`) when a channel changes state; envelopes run at
+  audio rate in `line~`, not in JS.
 - **`plugin~`/`plugout~` must stay wired together** (outlet 0 -> inlet 0,
   outlet 1 -> inlet 1). Without that, the device silences the whole group's
   audio even though it does no DSP of its own — Live routes the chain's
@@ -150,9 +168,8 @@ attribute value, but always re-validate structurally afterward.
 - Per-channel probability weighting instead of (or in addition to) the
   range-based approach.
 - A "lock" per channel to exclude it from auto-balance.
-- Investigate whether wrapping target tracks in Audio Effect Racks and
-  controlling Macros via `live.remote~` is worth it to avoid polluting
-  Live's undo history (see gotcha above) — would be a bigger redesign.
+- Tempo-synced (note value) Attack/Release as an alternative to ms.
+- Option to release the faders (`id 0`) while Off, for manual mixing.
 - Single-file distribution via embedding `randomgroup.js` inside the
   `.amxd` (Max supports this for `js` objects via an "Embed" option, not
   yet confirmed to exist/work in this Max version — see `js` object's
