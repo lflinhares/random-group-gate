@@ -9,8 +9,9 @@ ______           _   ______
 Random Group Gate
 ==================
 
-Dispositivo Max for Live que muta/desmuta aleatoriamente as faixas dentro
-de um Grupo, em um ritmo sincronizado com o tempo do projeto.
+Dispositivo Max for Live que abre/fecha aleatoriamente as faixas dentro
+de um Grupo, sincronizado com o tempo do projeto, controlando o volume de
+cada faixa com um envelope (attack/release).
 
 ARQUIVOS NECESSÁRIOS
 ---------------------
@@ -33,22 +34,32 @@ INSTALAÇÃO
 
 COMO USAR
 ---------
-- Rate: escolhe a frequência dos sorteios (1/32 até 2 bars), sincronizado
-  ao tempo/compasso do projeto.
-- On/Off: liga/desliga o sorteio automático. Já começa ligado, e também
-  pausa sozinho quando o transporte do Live não está tocando.
+- Min/Max por canal: a cada sorteio (0-100), todo canal cujo intervalo
+  contém o número "ganha" e abre. Intervalos podem se sobrepor para abrir
+  mais de um canal ao mesmo tempo. Intervalo 0-0 desativa o canal.
+- Len por canal: por quanto tempo o canal fica aberto quando ganha
+  (1/32 até 4 bars). O próximo sorteio acontece quando o canal mais longo
+  terminar.
+- Level por canal (dB): volume do canal quando aberto. Enquanto o
+  dispositivo estiver carregado, os faders de volume dessas faixas ficam
+  travados no mixer do Live - ajuste o volume por aqui.
+- Rest: quanto tempo o grupo fica em silêncio quando o sorteio não cai
+  em nenhum canal.
+- Attack / Release (ms): tempo de subida/descida do volume ao abrir/fechar.
+- Floor (dB): volume do canal fechado. -70 = mudo total; valores mais
+  altos (ex: -12) deixam o canal "abaixado" em vez de cortado.
+- On/Off: liga/desliga o sorteio. Desligado, ou com o transporte do Live
+  parado, todos os canais ficam abertos no seu Level.
 - refresh: clique depois de adicionar/remover faixas do grupo, para o
-  dispositivo re-escanear quais faixas ele controla (até 8).
+  dispositivo re-escanear quais faixas ele controla (até 8). Não altera
+  seus intervalos.
 - autobalance: divide 0-100 igualmente entre as faixas reais encontradas
-  no grupo. Roda automaticamente ao carregar o dispositivo também.
-- Min/Max por canal: cada canal (1-8) liga quando o número sorteado (0-100)
-  cai dentro do seu intervalo. Intervalos podem se sobrepor para permitir
-  mais de um canal ligado ao mesmo tempo.
+  no grupo. Roda sozinho só na primeira vez (dispositivo novo).
 - Last Roll: mostra o último número sorteado.
 
-Rate e On/Off podem ser automatizados/mapeados como parâmetros normais
-do Live (clique direito no controle no Max > Inspector > Parameter, se
-quiser reconfigurar).
+Todos os controles são parâmetros do Live: dá para automatizar, salvar
+em presets e mapear no LFO / Envelope Follower / macros do Live (botão
+"Map" do LFO, depois clique no controle).
 
 PROBLEMAS COMUNS
 -----------------

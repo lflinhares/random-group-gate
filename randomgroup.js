@@ -5,62 +5,91 @@
 // What it does:
 //  - Finds the Group Track that this device is sitting on.
 //  - Collects up to 8 child tracks inside that group, in order.
-//  - On every clock tick (from the device's metro, tempo-synced), rolls a
-//    random number 0-100 and compares it against each channel's [min,max]
-//    range. If the roll falls inside a channel's range, that channel's
-//    track is unmuted; otherwise it is muted. Overlapping ranges simply
-//    mean more than one channel can be "on" for the same roll.
+//  - Rolls a random number 0-100. Every channel whose [min,max] range
+//    contains the roll "wins" and opens for its own Length (1/32 ... 4
+//    bars). The next roll happens when the longest winner has finished.
+//    If nothing wins, the group rests (all closed) for the Rest length.
+//  - Channels are opened/closed by riding each track's VOLUME fader through
+//    [live.remote~] with an Attack/Release envelope, between that channel's
+//    Level and the global Floor. Unlike track mute, live.remote~ does not
+//    write anything to Live's Undo history.
+//  - Clock: a transport-synced [metro 32n @quantize 32n] bangs this script
+//    on every 32nd note. Each tick reads Live's song position, so all
+//    timing is locked to Live's grid (no ms drift), and jumps/loops are
+//    handled by re-rolling.
+//  - When Live's transport stops or the device is switched Off, every
+//    channel opens back up to its Level.
 //
-// Inlets:
-//   0 - bang (from metro) -> triggers a roll, OR int (from the On/Off
-//       toggle) -> enables/disables the clock
-//   1 - int  (from the rate umenu, 0-6) -> selects note-value multiplier
-//   2 - list (16 ints: min1 max1 min2 max2 ... min8 max8) from [pak], OR
-//       the symbol "refresh" (from the Refresh message box) -> rescans the group
+// Inlet 0 receives everything:
+//   bang                     - from the metro (one per 32nd note)
+//   setparam <name> <ch> <v> - from the UI, via [prepend setparam ...]:
+//                              min/max/len/level (ch 1-8), and
+//                              rest/onoff/attack/release/floor (ch 0)
+//   refresh                  - rescan the group (also sent by live.thisdevice)
+//   autobalance              - split 0-100 evenly across the found tracks
 //
 // Outlets:
-//   0 - int, ms interval -> feed directly into [metro]'s right inlet
-//   1 - int, last roll value (0-100) -> display number box
-//   2-9 - int (0/1), per-channel enabled state -> indicator toggles for
-//         channels 1-8
-//   10 - int (0/1), the metro's actual run state -> feed into [metro]'s
-//        left inlet. This is (On/Off toggle) AND (Live's transport is
-//        playing), so the random rolling automatically stops when
-//        playback stops, and resumes when it starts again.
+//   0      - int, last roll value (0-100) -> display number box
+//   1-8    - int (0/1), per-channel open state -> indicator toggles
+//   9      - int (0/1), metro on/off
+//   10-17  - list <target> <ms> -> [line~] for channels 1-8
+//   18-25  - "id <n>" -> right inlet of [live.remote~] for channels 1-8
 
-inlets = 3;
-outlets = 11;
+inlets = 1;
+outlets = 26;
 
 autowatch = 1;
 
 var NUM_CHANNELS = 8;
-var ranges = [];
+var OUT_ROLL = 0;
+var OUT_INDICATOR = 1;
+var OUT_METRO = 9;
+var OUT_ENV = 10;
+var OUT_REMOTE = 18;
+
+// Length menu index -> length in 32nd notes. null = depends on the time
+// signature, see lengthTicks().
+var LENGTH_TICKS = [1, 2, 4, 8, 16, null, null, null]; // 1/32 .. 1/2, 1bar, 2bars, 4bars
+var BAR_MULTIPLES = { 5: 1, 6: 2, 7: 4 };
+
+var FLOOR_SILENT_DB = -69.5; // at or below this, the Floor means -inf
+var MIN_RAMP_MS = 2; // never jump instantly - avoids clicks
+
+var channels = [];
 for (var i = 0; i < NUM_CHANNELS; i++) {
-	ranges.push({ min: 0, max: 100 });
+	channels.push({
+		minRaw: 0, maxRaw: 0, // as typed (in either order)
+		min: 0, max: 0, // normalized, clamped 0-100
+		len: 3, // index into the Length menu (1/4)
+		levelDb: 0
+	});
 }
 
+var restIndex = 3; // Length used when a roll hits no channel
+var masterEnabled = 1;
+var attackMs = 10;
+var releaseMs = 80;
+var floorDb = -70;
+
 var groupTrackId = null;
-var trackIds = []; // ids of tracks living inside the group, in order
-var trackAPIs = []; // cached LiveAPI objects, one per track (built once, reused)
-var lastMuteState = []; // last mute value actually sent per channel, or
-                         // undefined if never sent yet - used to skip
-                         // redundant LiveAPI calls when nothing changed
+var tracks = []; // { id, volumeId } per channel, in group order
 
-var msPerBeat = 500; // fallback until tempo is read (120 bpm)
-var beatsPerBar = 4; // fallback until time signature is read
-var rateIndex = 3; // default to 1/4 note
-// multiplier expresses the rate as a fraction/multiple of ONE BEAT
-var RATE_BEAT_MULTIPLIERS = [0.125, 0.25, 0.5, 1, 2, null, null];
-// indices 5 and 6 ("1 bar", "2 bars") are resolved using beatsPerBar instead,
-// see rateToBeats() below.
+var gateOpen = []; // per channel: true = at Level, false = at Floor
+var rampEndsAt = []; // per channel: Date.now() when its current ramp finishes
+var channelEndsAt = []; // per channel: song position (32nds) where it closes
+var nextRollAt = 0; // song position (32nds) of the next roll
+var lastPos = -1; // song position of the last tick handled, -1 = reset
 
-var tempoAPI = null;
+var beatsPerBar = 4; // fallback until the time signature is read
+
+var songAPI = null;
 var sigNumAPI = null;
 var sigDenAPI = null;
 var playAPI = null;
 
-var masterEnabled = 1; // mirrors the On/Off toggle (inlet 0, int) - defaults on
-var transportPlaying = 0; // mirrors live_set's is_playing
+// dB -> fader value lookup, built from Live's own volume parameter
+// (see buildVolumeTable). Empty = use the approximation in dbToFader().
+var volTable = [];
 
 function post_safe(msg) {
 	try {
@@ -73,90 +102,97 @@ function post_safe(msg) {
 // ---------------------------------------------------------------------
 
 function loadbang() {
-	// NOTE: Live's API is usually NOT ready yet when this fires - that's
-	// expected. Real initialization happens via the "refresh" message,
-	// which should be wired to a [live.thisdevice] object's outlet so it
-	// fires again once Live's API is actually ready. This first call is
-	// just a best-effort attempt in case the API happens to be ready.
-	init();
+	// Live's API is usually NOT ready yet when this fires. Real
+	// initialization happens via the "refresh" message, which is wired to
+	// [live.thisdevice] so it fires once Live's API is actually ready.
 }
 
 function init() {
-	syncRateMenu();
-	syncOnOffToggle();
+	readAllParams();
 	findGroupTrack();
 	collectChildren();
-	setupTempoWatch();
+	setupSignatureWatch();
 	setupTransportWatch();
-	updateInterval();
-	// auto-balance the ranges across whatever tracks were just found, and
-	// it also does one immediate roll so the channels start in a defined
-	// state (even if no tracks were found yet, in which case it just rolls
-	// without touching any track).
-	autobalance();
+	// first load of a fresh device (every range still 0-0): spread the
+	// ranges across the tracks that were found. Saved ranges are kept.
+	if (rangesUnset()) autobalance();
+	openAll();
+	updateMetroState();
 }
 
-// Makes the Rate dropdown actually display whatever rateIndex is really
-// running, instead of just showing whatever item happens to be first in
-// its list. Uses umenu's "set" message, which changes the display without
-// triggering output (so this can't cause a feedback loop with msg_int()).
-function syncRateMenu() {
-	try {
-		var rateMenu = this.patcher.getnamed("rgg_rate");
-		if (rateMenu) rateMenu.message("set", rateIndex);
-	} catch (e) {}
-}
-
-// Same idea as syncRateMenu(), but for the On/Off toggle: makes it visually
-// show masterEnabled's real value (defaults on) instead of the toggle's own
-// default appearance.
-function syncOnOffToggle() {
-	try {
-		var toggle = this.patcher.getnamed("rgg_onoff");
-		if (toggle) toggle.message(masterEnabled);
-	} catch (e) {}
-}
-
-// Called by clicking the "refresh" message box, OR automatically by
-// [live.thisdevice] once Live's API is confirmed ready (see loadbang note
-// above). Fully reinitializes: group detection, tempo sync, and one roll.
+// Called by clicking "refresh", OR automatically by [live.thisdevice].
+// Rescans the group. Does NOT overwrite your ranges - use autobalance.
 function refresh() {
 	init();
-	post_safe("randomgroup: refreshed, found " + trackIds.length + " channel(s)");
+	post_safe("randomgroup: refreshed, found " + tracks.length + " channel(s)");
+}
+
+// Pulls every parameter's current value straight from the UI objects, so
+// the script is in sync even if it was reloaded (autowatch) after the
+// parameters had already sent their values.
+function readAllParams() {
+	for (var i = 0; i < NUM_CHANNELS; i++) {
+		var ch = i + 1;
+		var v;
+		if ((v = readParam("rgg_min" + ch)) !== null) channels[i].minRaw = v;
+		if ((v = readParam("rgg_max" + ch)) !== null) channels[i].maxRaw = v;
+		normalizeRange(i);
+		if ((v = readParam("rgg_len" + ch)) !== null) channels[i].len = clampLength(v);
+		if ((v = readParam("rgg_level" + ch)) !== null) channels[i].levelDb = v;
+	}
+	if ((v = readParam("rgg_rate")) !== null) restIndex = clampLength(v);
+	if ((v = readParam("rgg_onoff")) !== null) masterEnabled = v ? 1 : 0;
+	if ((v = readParam("rgg_attack")) !== null) attackMs = Math.max(0, v);
+	if ((v = readParam("rgg_release")) !== null) releaseMs = Math.max(0, v);
+	if ((v = readParam("rgg_floor")) !== null) floorDb = v;
+}
+
+function readParam(name) {
+	try {
+		var box = this.patcher.getnamed(name);
+		if (!box) return null;
+		var v = box.getvalueof();
+		if (v instanceof Array) v = v[0];
+		v = Number(v);
+		return isNaN(v) ? null : v;
+	} catch (e) {
+		return null;
+	}
+}
+
+function rangesUnset() {
+	if (tracks.length == 0) return false;
+	for (var i = 0; i < tracks.length; i++) {
+		if (channels[i].max > 0) return false;
+	}
+	return true;
 }
 
 // Called by clicking the "autobalance" message box in the device UI.
-// Splits 0-100 evenly across however many real tracks are in the group
-// (up to NUM_CHANNELS), and pushes the new values into the min/max number
-// boxes by name (no patch cords needed for this). Channels beyond the
-// actual track count are set to 0-0 (always off) since there's no track
-// for them to control.
+// Splits 0-100 evenly (no overlap) across however many real tracks are in
+// the group, and pushes the new values into the Min/Max boxes by Scripting
+// Name. Channels beyond the track count are set to 0-0 (disabled).
 function autobalance() {
-	var count = Math.min(trackIds.length, NUM_CHANNELS);
+	var count = Math.min(tracks.length, NUM_CHANNELS);
 	if (count <= 0) {
 		post_safe("randomgroup: no channels found in the group yet - click " +
 			"refresh first (and make sure this device is on the Group track).");
-		doRoll(); // still roll once so the UI is in a defined state
 		return;
 	}
 	var summary = "randomgroup: auto-balanced " + count + " channel(s) -";
 	for (var i = 0; i < NUM_CHANNELS; i++) {
-		var lo, hi;
+		var lo = 0, hi = 0;
 		if (i < count) {
-			lo = Math.round((i * 100) / count);
+			lo = (i == 0) ? 0 : Math.round((i * 100) / count) + 1;
 			hi = Math.round(((i + 1) * 100) / count);
 			summary += " Ch" + (i + 1) + ":" + lo + "-" + hi;
-		} else {
-			lo = 0;
-			hi = 0;
 		}
-		ranges[i].min = lo;
-		ranges[i].max = hi;
-		// Update the visible number boxes by their Scripting Name. Note:
-		// messnamed() does NOT work here - it only targets objects bound to
-		// a GLOBAL symbol (like [receive]), not a patcher-local Scripting
-		// Name. The correct API for that is this.patcher.getnamed(), which
-		// returns the box itself so we can send it a message directly.
+		channels[i].minRaw = lo;
+		channels[i].maxRaw = hi;
+		normalizeRange(i);
+		// Note: messnamed() does NOT work here - it only targets objects
+		// bound to a GLOBAL symbol (like [receive]), not a patcher-local
+		// Scripting Name. this.patcher.getnamed() is the correct API.
 		try {
 			var minBox = this.patcher.getnamed("rgg_min" + (i + 1));
 			if (minBox) minBox.message(lo);
@@ -167,7 +203,6 @@ function autobalance() {
 		}
 	}
 	post_safe(summary);
-	doRoll();
 }
 
 function findGroupTrack() {
@@ -201,122 +236,167 @@ function findGroupTrack() {
 }
 
 function collectChildren() {
-	trackIds = [];
-	trackAPIs = [];
-	lastMuteState = [];
-	if (groupTrackId === null) return;
+	// let go of every fader first; the ones still in the group get re-bound
+	for (var r = 0; r < NUM_CHANNELS; r++) {
+		outlet(OUT_REMOTE + r, "id", 0);
+	}
+	tracks = [];
+	gateOpen = [];
+	rampEndsAt = [];
+	channelEndsAt = [];
+	if (groupTrackId === null) {
+		updateIndicators();
+		return;
+	}
 	try {
 		var liveSet = new LiveAPI("live_set");
 		var numTracks = liveSet.getcount("tracks");
-		for (var i = 0; i < numTracks; i++) {
+		for (var i = 0; i < numTracks && tracks.length < NUM_CHANNELS; i++) {
 			var t = new LiveAPI("live_set tracks " + i);
 			var gt = t.get("group_track");
 			var parentId = (gt && gt.length > 1) ? gt[1] : 0;
-			if (parentId == groupTrackId) {
-				trackIds.push(t.id);
+			if (parentId != groupTrackId) continue;
+
+			// older versions of this device gated with mute - make sure no
+			// track is left muted from that (one-time, only if muted)
+			var m = t.get("mute");
+			if (m && m[0] == 1) {
+				t.set("mute", 0);
+				post_safe("randomgroup: unmuted track " + (i + 1) +
+					" (this device now gates with volume, not mute)");
 			}
-			if (trackIds.length >= NUM_CHANNELS) break;
-		}
-		// build one cached LiveAPI object per track now, instead of
-		// constructing a new one on every single metro tick later
-		for (var j = 0; j < trackIds.length; j++) {
-			trackAPIs[j] = new LiveAPI("id " + trackIds[j]);
-			lastMuteState[j] = undefined; // force the first roll to apply
+
+			var vol = new LiveAPI("live_set tracks " + i + " mixer_device volume");
+			if (volTable.length == 0) buildVolumeTable(vol);
+			tracks.push({ id: t.id, volumeId: vol.id });
 		}
 	} catch (e) {
 		post_safe("randomgroup: error collecting child tracks - " + e);
 	}
+	// start every channel open at its Level, then hand the fader over to
+	// live.remote~ (line~ is set first so the fader never dips)
+	var now = Date.now();
+	for (var j = 0; j < tracks.length; j++) {
+		gateOpen[j] = true;
+		rampEndsAt[j] = now;
+		channelEndsAt[j] = 0;
+		outlet(OUT_ENV + j, dbToFader(channels[j].levelDb), 0);
+		outlet(OUT_REMOTE + j, "id", tracks[j].volumeId);
+	}
+	updateIndicators();
 }
 
 // ---------------------------------------------------------------------
-// Tempo / time-signature sync
+// dB <-> Live's volume fader (0.0-1.0, 0.85 = 0 dB, not linear)
 // ---------------------------------------------------------------------
 
-function setupTempoWatch() {
+// Asks Live itself what each fader position means in dB, so the dB values
+// on the device match the mixer exactly. Done once.
+function buildVolumeTable(volAPI) {
+	var STEPS = 200;
+	var table = [];
 	try {
-		tempoAPI = new LiveAPI(onTempoChanged, "live_set");
-		tempoAPI.property = "tempo";
-		var t = tempoAPI.get("tempo");
-		if (t && t.length) msPerBeat = 60000.0 / t[0];
-
-		sigNumAPI = new LiveAPI(onSignatureChanged, "live_set");
-		sigNumAPI.property = "signature_numerator";
-		sigDenAPI = new LiveAPI(function(){}, "live_set");
-		sigDenAPI.property = "signature_denominator";
-
-		var num = sigNumAPI.get("signature_numerator");
-		var den = sigDenAPI.get("signature_denominator");
-		if (num && den && num[0] && den[0]) {
-			beatsPerBar = num[0] * (4.0 / den[0]);
+		for (var k = 0; k <= STEPS; k++) {
+			var v = k / STEPS;
+			var db = parseDb(volAPI.call("str_for_value", v));
+			if (!isNaN(db)) table.push({ v: v, db: db });
 		}
 	} catch (e) {
-		post_safe("randomgroup: error watching tempo/signature - " + e);
+		table = [];
+	}
+	var finite = 0;
+	for (var n = 0; n < table.length; n++) {
+		if (isFinite(table[n].db)) finite++;
+	}
+	if (finite >= 20) {
+		volTable = table;
+	} else {
+		post_safe("randomgroup: could not read Live's volume curve, using an approximation");
 	}
 }
 
-function onTempoChanged(args) {
-	// args is like ["tempo", 128]
-	if (args && args.length > 1) {
-		msPerBeat = 60000.0 / args[1];
-		updateInterval();
+function parseDb(s) {
+	var str = (s instanceof Array) ? s.join(" ") : String(s);
+	if (/inf/i.test(str)) return -Infinity;
+	var m = str.match(/-?\d+(\.\d+)?/);
+	return m ? parseFloat(m[0]) : NaN;
+}
+
+function dbToFader(db) {
+	if (db <= FLOOR_SILENT_DB) return 0;
+	if (volTable.length) {
+		var prev = null;
+		for (var k = 0; k < volTable.length; k++) {
+			var e = volTable[k];
+			if (!isFinite(e.db)) continue;
+			if (e.db >= db) {
+				if (prev === null || e.db == prev.db) return e.v;
+				return prev.v + (e.v - prev.v) * (db - prev.db) / (e.db - prev.db);
+			}
+			prev = e;
+		}
+		return prev ? prev.v : 1;
+	}
+	// rough fallback: ~40 dB per unit above -30 dB, steeper below
+	var v = (db >= -30) ? 0.85 + db / 40 : 0.1 * (db + 70) / 40;
+	return Math.max(0, Math.min(1, v));
+}
+
+// ---------------------------------------------------------------------
+// Time signature / transport
+// ---------------------------------------------------------------------
+
+function setupSignatureWatch() {
+	try {
+		songAPI = new LiveAPI("live_set");
+		sigNumAPI = new LiveAPI(onSignatureChanged, "live_set");
+		sigNumAPI.property = "signature_numerator";
+		sigDenAPI = new LiveAPI(onSignatureChanged, "live_set");
+		sigDenAPI.property = "signature_denominator";
+		onSignatureChanged();
+	} catch (e) {
+		post_safe("randomgroup: error watching time signature - " + e);
 	}
 }
 
 function onSignatureChanged(args) {
 	try {
-		var num = sigNumAPI.get("signature_numerator");
-		var den = sigDenAPI.get("signature_denominator");
+		var num = songAPI.get("signature_numerator");
+		var den = songAPI.get("signature_denominator");
 		if (num && den && num[0] && den[0]) {
 			beatsPerBar = num[0] * (4.0 / den[0]);
-			updateInterval();
 		}
 	} catch (e) {}
 }
-
-// ---------------------------------------------------------------------
-// Transport (play/stop) sync - stops the metro when playback stops
-// ---------------------------------------------------------------------
 
 function setupTransportWatch() {
 	try {
 		playAPI = new LiveAPI(onPlayingChanged, "live_set");
 		playAPI.property = "is_playing";
-		var p = playAPI.get("is_playing");
-		if (p && p.length) transportPlaying = p[0] ? 1 : 0;
 	} catch (e) {
 		post_safe("randomgroup: error watching transport - " + e);
 	}
-	updateMetroState();
 }
 
 function onPlayingChanged(args) {
 	// args is like ["is_playing", 1]
-	if (args && args.length > 1) {
-		transportPlaying = args[1] ? 1 : 0;
-		updateMetroState();
+	if (args && args.length > 1 && !args[1]) {
+		openAll();
 	}
 }
 
-// Combines the On/Off toggle with Live's transport state and pushes the
-// result out to [metro]'s left inlet, so the random rolling only ever
-// runs while both are true: the user has it enabled AND playback is
-// actually running.
 function updateMetroState() {
-	var shouldRun = (masterEnabled && transportPlaying) ? 1 : 0;
-	outlet(10, shouldRun);
+	outlet(OUT_METRO, masterEnabled ? 1 : 0);
 }
 
-function rateToBeats(idx) {
-	if (idx == 5) return beatsPerBar; // 1 bar
-	if (idx == 6) return beatsPerBar * 2; // 2 bars
-	if (RATE_BEAT_MULTIPLIERS[idx] != null) return RATE_BEAT_MULTIPLIERS[idx];
-	return 1; // fallback: quarter note
+function lengthTicks(idx) {
+	if (LENGTH_TICKS[idx] != null) return LENGTH_TICKS[idx];
+	var bars = BAR_MULTIPLES[idx] || 1;
+	return Math.max(1, Math.round(beatsPerBar * 8 * bars));
 }
 
-function updateInterval() {
-	var beats = rateToBeats(rateIndex);
-	var ms = Math.max(1, Math.round(beats * msPerBeat));
-	outlet(0, ms);
+function clampLength(v) {
+	return Math.max(0, Math.min(LENGTH_TICKS.length - 1, Math.round(v)));
 }
 
 // ---------------------------------------------------------------------
@@ -324,59 +404,129 @@ function updateInterval() {
 // ---------------------------------------------------------------------
 
 function bang() {
-	// arrives on inlet 0, from metro
-	doRoll();
-}
-
-function msg_int(v) {
-	if (inlet == 0) {
-		// from the On/Off toggle
-		masterEnabled = v ? 1 : 0;
-		updateMetroState();
-	} else if (inlet == 1) {
-		rateIndex = Math.max(0, Math.min(6, Math.round(v)));
-		updateInterval();
-	}
-}
-
-function list() {
-	// arrives on inlet 2, from [pak]: min1 max1 min2 max2 ... min8 max8
-	if (inlet != 2) return;
-	var a = arrayfromargs(arguments);
-	for (var i = 0; i < NUM_CHANNELS; i++) {
-		var lo = a[i * 2];
-		var hi = a[i * 2 + 1];
-		if (lo === undefined || hi === undefined) continue;
-		var lower = Math.min(lo, hi);
-		var upper = Math.max(lo, hi);
-		// clamp to 0-100 no matter what the number boxes display, so a
-		// stray/garbled value never breaks the comparison against the roll
-		ranges[i].min = Math.max(0, Math.min(100, lower));
-		ranges[i].max = Math.max(0, Math.min(100, upper));
-	}
-}
-
-function doRoll() {
-	var roll = Math.floor(Math.random() * 101); // 0-100 inclusive
-	outlet(1, roll);
-	for (var i = 0; i < NUM_CHANNELS; i++) {
-		var r = ranges[i];
-		var enabled = (roll >= r.min && roll <= r.max) ? 1 : 0;
-		outlet(2 + i, enabled);
-		setMute(i, enabled ? 0 : 1);
-	}
-}
-
-function setMute(i, muteVal) {
-	if (trackAPIs[i] === undefined) return;
-	// skip the LiveAPI call entirely if this channel's mute state didn't
-	// actually change from the last roll - this is the main CPU saving,
-	// since most ticks leave most channels' state unchanged
-	if (lastMuteState[i] === muteVal) return;
+	// one per 32nd note, from [metro 32n @quantize 32n]
+	if (!masterEnabled || songAPI === null) return;
+	var pos;
 	try {
-		trackAPIs[i].set("mute", muteVal);
-		lastMuteState[i] = muteVal;
+		var playing = songAPI.get("is_playing");
+		if (!playing || !playing[0]) return;
+		var t = songAPI.get("current_song_time"); // in beats
+		pos = Math.round(t[0] * 8); // in 32nd notes
 	} catch (e) {
-		post_safe("randomgroup: could not set mute for channel " + (i + 1) + " - " + e);
+		return;
+	}
+	if (pos == lastPos) return; // duplicate tick
+	if (lastPos < 0 || pos < lastPos) {
+		// (re)start, loop or jump backwards: roll right away
+		nextRollAt = pos;
+		for (var c = 0; c < channelEndsAt.length; c++) channelEndsAt[c] = pos;
+	}
+	lastPos = pos;
+
+	if (pos >= nextRollAt) doRoll(pos);
+	for (var i = 0; i < tracks.length; i++) {
+		setGate(i, pos < channelEndsAt[i]);
+	}
+}
+
+function setparam(name, ch, v) {
+	var i = Math.round(ch) - 1;
+	var hasChannel = (i >= 0 && i < NUM_CHANNELS);
+	if (name == "min" && hasChannel) {
+		channels[i].minRaw = v;
+		normalizeRange(i);
+	} else if (name == "max" && hasChannel) {
+		channels[i].maxRaw = v;
+		normalizeRange(i);
+	} else if (name == "len" && hasChannel) {
+		channels[i].len = clampLength(v);
+	} else if (name == "level" && hasChannel) {
+		channels[i].levelDb = v;
+		if (gateOpen[i]) followParam(i);
+	} else if (name == "rest") {
+		restIndex = clampLength(v);
+	} else if (name == "onoff") {
+		masterEnabled = v ? 1 : 0;
+		if (!masterEnabled) openAll();
+		lastPos = -1;
+		updateMetroState();
+	} else if (name == "attack") {
+		attackMs = Math.max(0, v);
+	} else if (name == "release") {
+		releaseMs = Math.max(0, v);
+	} else if (name == "floor") {
+		floorDb = v;
+		for (var c = 0; c < tracks.length; c++) {
+			if (gateOpen[c] === false) followParam(c);
+		}
+	}
+}
+
+function normalizeRange(i) {
+	var c = channels[i];
+	var lower = Math.min(c.minRaw, c.maxRaw);
+	var upper = Math.max(c.minRaw, c.maxRaw);
+	// clamp to 0-100 no matter what the boxes display
+	c.min = Math.max(0, Math.min(100, lower));
+	c.max = Math.max(0, Math.min(100, upper));
+}
+
+// ---------------------------------------------------------------------
+// Rolling / gating
+// ---------------------------------------------------------------------
+
+function doRoll(pos) {
+	var roll = Math.floor(Math.random() * 101); // 0-100 inclusive
+	outlet(OUT_ROLL, roll);
+	var longest = 0;
+	for (var i = 0; i < tracks.length; i++) {
+		var c = channels[i];
+		// a 0-0 range means "disabled"
+		var hit = c.max > 0 && roll >= c.min && roll <= c.max;
+		if (hit) {
+			var len = lengthTicks(c.len);
+			channelEndsAt[i] = pos + len;
+			if (len > longest) longest = len;
+		}
+	}
+	if (longest == 0) longest = lengthTicks(restIndex); // nothing won: rest
+	nextRollAt = pos + longest;
+}
+
+// Opens/closes one channel with the Attack/Release envelope. Does nothing
+// if the channel is already in that state, so a channel that wins twice in
+// a row just keeps playing.
+function setGate(i, open) {
+	if (i >= tracks.length || gateOpen[i] === open) return;
+	gateOpen[i] = open;
+	outlet(OUT_INDICATOR + i, open ? 1 : 0);
+	ramp(i, open ? attackMs : releaseMs);
+}
+
+function ramp(i, ms) {
+	ms = Math.max(MIN_RAMP_MS, ms);
+	var db = gateOpen[i] ? channels[i].levelDb : floorDb;
+	rampEndsAt[i] = Date.now() + ms;
+	outlet(OUT_ENV + i, dbToFader(db), ms);
+}
+
+// Level/Floor changed (by hand, automation or an LFO): glide to the new
+// value over whatever is left of the current ramp, so a moving Floor does
+// not cut a long release short.
+function followParam(i) {
+	var left = (rampEndsAt[i] || 0) - Date.now();
+	ramp(i, Math.max(15, left));
+}
+
+function openAll() {
+	lastPos = -1;
+	for (var i = 0; i < tracks.length; i++) {
+		setGate(i, true);
+	}
+}
+
+function updateIndicators() {
+	for (var i = 0; i < NUM_CHANNELS; i++) {
+		outlet(OUT_INDICATOR + i, (i < tracks.length && gateOpen[i]) ? 1 : 0);
 	}
 }
