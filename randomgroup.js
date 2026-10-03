@@ -7,7 +7,9 @@
 //  - Collects up to 8 child tracks inside that group, in order.
 //  - Rolls a random number 0-100. Every channel whose [min,max] range
 //    contains the roll "wins" and opens for its own Length (1/32 ... 4
-//    bars). The next roll happens when the longest winner has finished.
+//    bars) - or, if "to" is set, a random length between Len and "to",
+//    picked from the menu steps on every win. The next roll happens when
+//    the longest winner has finished.
 //    If nothing wins, the group rests (all closed) for the Rest length.
 //  - Channels are opened/closed by riding each track's VOLUME fader through
 //    [live.remote~] with an Attack/Release envelope, between that channel's
@@ -23,7 +25,7 @@
 // Inlet 0 receives everything:
 //   bang                     - from the metro (one per 32nd note)
 //   setparam <name> <ch> <v> - from the UI, via [prepend setparam ...]:
-//                              min/max/len/level (ch 1-8), and
+//                              min/max/len/lenmax/level (ch 1-8), and
 //                              rest/onoff/attack/release/floor (ch 0)
 //   refresh                  - rescan the group (also sent by live.thisdevice)
 //   autobalance              - split 0-100 evenly across the found tracks
@@ -61,6 +63,7 @@ for (var i = 0; i < NUM_CHANNELS; i++) {
 		minRaw: 0, maxRaw: 0, // as typed (in either order)
 		min: 0, max: 0, // normalized, clamped 0-100
 		len: 3, // index into the Length menu (1/4)
+		lenMax: 0, // index into the "to" menu: 0 = "=" (fixed Len), else Length index + 1
 		levelDb: 0
 	});
 }
@@ -138,6 +141,7 @@ function readAllParams() {
 		if ((v = readParam("rgg_max" + ch)) !== null) channels[i].maxRaw = v;
 		normalizeRange(i);
 		if ((v = readParam("rgg_len" + ch)) !== null) channels[i].len = clampLength(v);
+		if ((v = readParam("rgg_lenmax" + ch)) !== null) channels[i].lenMax = clampLenMax(v);
 		if ((v = readParam("rgg_level" + ch)) !== null) channels[i].levelDb = v;
 	}
 	if ((v = readParam("rgg_rate")) !== null) restIndex = clampLength(v);
@@ -399,6 +403,11 @@ function clampLength(v) {
 	return Math.max(0, Math.min(LENGTH_TICKS.length - 1, Math.round(v)));
 }
 
+// "to" menu: 0 = "=", 1-8 = Length index + 1
+function clampLenMax(v) {
+	return Math.max(0, Math.min(LENGTH_TICKS.length, Math.round(v)));
+}
+
 // ---------------------------------------------------------------------
 // Message handlers
 // ---------------------------------------------------------------------
@@ -440,6 +449,8 @@ function setparam(name, ch, v) {
 		normalizeRange(i);
 	} else if (name == "len" && hasChannel) {
 		channels[i].len = clampLength(v);
+	} else if (name == "lenmax" && hasChannel) {
+		channels[i].lenMax = clampLenMax(v);
 	} else if (name == "level" && hasChannel) {
 		channels[i].levelDb = v;
 		if (gateOpen[i]) followParam(i);
@@ -484,13 +495,22 @@ function doRoll(pos) {
 		// a 0-0 range means "disabled"
 		var hit = c.max > 0 && roll >= c.min && roll <= c.max;
 		if (hit) {
-			var len = lengthTicks(c.len);
+			var len = lengthTicks(pickLength(c));
 			channelEndsAt[i] = pos + len;
 			if (len > longest) longest = len;
 		}
 	}
 	if (longest == 0) longest = lengthTicks(restIndex); // nothing won: rest
 	nextRollAt = pos + longest;
+}
+
+// Length menu index for this win: Len itself, or a random step between
+// Len and "to" (either order works).
+function pickLength(c) {
+	if (c.lenMax <= 0) return c.len;
+	var lo = Math.min(c.len, c.lenMax - 1);
+	var hi = Math.max(c.len, c.lenMax - 1);
+	return lo + Math.floor(Math.random() * (hi - lo + 1));
 }
 
 // Opens/closes one channel with the Attack/Release envelope. Does nothing

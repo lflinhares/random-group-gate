@@ -40,6 +40,9 @@ COMO USAR
 - Len por canal: por quanto tempo o canal fica aberto quando ganha
   (1/32 até 4 bars). O próximo sorteio acontece quando o canal mais longo
   terminar.
+- to por canal: se definido, cada vez que o canal ganha ele sorteia uma
+  duração entre Len e "to" (ex: Len 1/4, to 1bar = 1/4, 1/2 ou 1bar).
+  "=" (padrão) mantém a duração fixa do Len.
 - Level por canal (dB): volume do canal quando aberto. Enquanto o
   dispositivo estiver carregado, os faders de volume dessas faixas ficam
   travados no mixer do Live - ajuste o volume por aqui.

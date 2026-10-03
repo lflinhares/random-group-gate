@@ -18,8 +18,11 @@ track's volume fader with an attack/release envelope.
 - Up to 8 channels, each mapped to a track inside the group (by position,
   top to bottom).
 - Rolls a random number 0-100. Every channel whose Min/Max range contains
-  the roll wins and opens for its own **Length** (1/32 ... 4 bars). The
-  next roll happens when the longest winner has finished. If nothing wins,
+  the roll wins and opens for its own **Length** (1/32 ... 4 bars). If the
+  channel's **to** menu is set (default `=` = fixed), each win instead
+  picks a random length between Len and "to", from the menu steps (so
+  1/4 to 1bar gives 1/4, 1/2 or 1bar). The next roll happens when the
+  longest winner has finished. If nothing wins,
   every channel stays closed for the **Rest** length.
   Overlapping ranges still let several channels open together. A 0-0 range
   disables a channel.
@@ -49,7 +52,7 @@ track's volume fader with an attack/release envelope.
 [autobalance message] ------------------------------------------------> js
 [metro 32n @quantize 32n] --(bang every 32nd, only while playing)----> js
 every parameter --> [prepend setparam <name> <ch>] -------------------> js
-   (min/max/len/level x 8 channels; rest, onoff, attack, release, floor)
+   (min/max/len/lenmax/level x 8 channels; rest, onoff, attack, release, floor)
 
 js outlet 0      -> "Last Roll" number box (display)
 js outlets 1-8   -> 8 toggles (per-channel open indicator)
@@ -70,7 +73,8 @@ All the real logic lives in `randomgroup.js`. The `.amxd` is mostly just UI
 ### Number boxes and Scripting Names
 
 Every parameter object has a Scripting Name (`varname`): `rgg_min1..8`,
-`rgg_max1..8`, `rgg_len1..8`, `rgg_level1..8`, `rgg_rate` (the Rest menu;
+`rgg_max1..8`, `rgg_len1..8`, `rgg_lenmax1..8` ("to"; index 0 = `=`),
+`rgg_level1..8`, `rgg_rate` (the Rest menu;
 its Live parameter is still called `rate` so old automation keeps working),
 `rgg_onoff`, `rgg_attack`, `rgg_release`, `rgg_floor`. On `refresh` the
 script reads them all with `getvalueof()`, so it is in sync even after an
