@@ -15,7 +15,7 @@ track's volume fader with an attack/release envelope.
 
 ## What it does
 
-- Up to 8 channels, each mapped to a track inside the group (by position,
+- Up to 16 channels, each mapped to a track inside the group (by position,
   top to bottom).
 - Rolls a random number 0-100. Every channel whose Min/Max range contains
   the roll wins and opens for its own **Length** (1/32 ... 4 bars). If the
@@ -26,6 +26,10 @@ track's volume fader with an attack/release envelope.
   every channel stays closed for the **Rest** length.
   Overlapping ranges still let several channels open together. A 0-0 range
   disables a channel.
+- **Manual** (on/off) + **Input** (1-100): when Manual is on, every roll
+  uses Input instead of a random number - automate it, MIDI-map it or put
+  an LFO on it to "play" the channel selection. It's read at roll time, so
+  lengths and the grid still apply.
 - Gating is done on each track's **volume fader** through `live.remote~`,
   with a global **Attack** / **Release** envelope (ms), between the
   channel's **Level** (dB) and the global **Floor** (dB; -70 = -inf, a
@@ -36,11 +40,22 @@ track's volume fader with an attack/release envelope.
 - Timing is locked to Live's grid: the clock ticks every 32nd note and
   reads Live's song position, so there is no drift, and loops/jumps simply
   trigger a new roll.
-- Auto Balance: splits 0-100 evenly (no overlap) across however many real
-  tracks are in the group. Runs automatically only on a fresh device
-  (every range still 0-0); after that, ranges are saved with the set and
-  only change when you click `autobalance`.
-- On/Off toggle: defaults on. When it's off or Live's transport stops,
+- Group changes are picked up automatically: the script observes the
+  set's `tracks` list and also polls group membership every 2 s (dragging
+  a track into a group doesn't always change the list). Only channels
+  whose track changed are re-bound; a track that leaves the group gets its
+  fader put back at its channel's Level (one Undo entry). The `refresh`
+  message box is hidden from the device face but must stay in the patch:
+  it is what `live.thisdevice` triggers to initialize the script.
+- Auto Balance (toggle, a Live parameter): splits 0-100 evenly (no
+  overlap) across however many real tracks are in the group - when it's
+  switched on, and again on every group change while it stays on (so it
+  overwrites hand-set Min/Max then). Off: ranges are saved with the set
+  and left alone; a fresh device (every range 0-0) still balances once.
+  Boxes that already hold the right value aren't rewritten.
+- On/Off is Live's own device on/off button (title bar), read from
+  `live.thisdevice`'s middle outlet. When the device is off or Live's
+  transport stops,
   every channel opens back up to its Level.
 - **Every control is a Live parameter**: automatable, saved with the set
   and presets, and mappable to Live's LFO / Envelope Follower / macros.
@@ -49,17 +64,19 @@ track's volume fader with an attack/release envelope.
 
 ```
 [live.thisdevice] --(bang on Live API ready)--> [refresh message] --> js
-[autobalance message] ------------------------------------------------> js
+[live.text: Auto Balance] --> [prepend setparam autobal 0] ----------> js
 [metro 32n @quantize 32n] --(bang every 32nd, only while playing)----> js
 every parameter --> [prepend setparam <name> <ch>] -------------------> js
-   (min/max/len/lenmax/level x 8 channels; rest, onoff, attack, release, floor)
+   (min/max/len/lenmax/level x 16 channels; rest, attack, release, floor,
+    manual, input)
+[live.thisdevice] middle outlet (device on/off) --> [prepend setparam onoff 0] --> js
 
-js outlet 0      -> "Last Roll" number box (display)
-js outlets 1-8   -> 8 toggles (per-channel open indicator)
-js outlet 9      -> [metro] left inlet (On/Off)
-js outlets 10-17 -> [line~] per channel ("<fader value> <ms>")
+js outlet 0      -> "Roll" number box (last roll, display)
+js outlets 1-16  -> 16 toggles (per-channel open indicator)
+js outlet 17     -> [metro] left inlet (device on/off)
+js outlets 18-33 -> [line~] per channel ("<fader value> <ms>")
                       -> [live.remote~] left inlet (the envelope signal)
-js outlets 18-25 -> [live.remote~] RIGHT inlet ("id <track volume id>")
+js outlets 34-49 -> [live.remote~] RIGHT inlet ("id <track volume id>")
 
 [plugin~] <-> [plugout~]   (self-looped stereo pass-through; this device
                              does no audio processing, but an Audio Effect
@@ -72,11 +89,11 @@ All the real logic lives in `randomgroup.js`. The `.amxd` is mostly just UI
 
 ### Number boxes and Scripting Names
 
-Every parameter object has a Scripting Name (`varname`): `rgg_min1..8`,
-`rgg_max1..8`, `rgg_len1..8`, `rgg_lenmax1..8` ("to"; index 0 = `=`),
-`rgg_level1..8`, `rgg_rate` (the Rest menu;
+Every parameter object has a Scripting Name (`varname`): `rgg_min1..16`,
+`rgg_max1..16`, `rgg_len1..16`, `rgg_lenmax1..16` ("to"; index 0 = `=`),
+`rgg_level1..16`, `rgg_rate` (the Rest menu;
 its Live parameter is still called `rate` so old automation keeps working),
-`rgg_onoff`, `rgg_attack`, `rgg_release`, `rgg_floor`. On `refresh` the
+`rgg_manual`, `rgg_input`, `rgg_attack`, `rgg_release`, `rgg_floor`. On `refresh` the
 script reads them all with `getvalueof()`, so it is in sync even after an
 autowatch reload. `randomgroup.js` uses these to push values into the
 UI programmatically (auto-balance writing new ranges) via:
@@ -113,9 +130,20 @@ of back-and-forth to figure out; don't reintroduce `messnamed()` for UI sync.
   Time Value string parsing within a device.
 - **Track mute changes always pollute Live's Undo history** - that's why
   the device no longer uses mute. Track volume *is* a LOM DeviceParameter,
-  so `live.remote~` can drive it without touching Undo. The one-time
-  "unmute tracks left muted by the old version" on refresh does make an
-  Undo entry, but only if a track was actually muted.
+  so `live.remote~` can drive it without touching Undo. (The old
+  migration step that unmuted tracks was removed: with automatic rescans
+  it would unmute any muted track dragged into the group.)
+- **Observer callbacks can't change the Live set.** The `tracks` observer
+  only schedules a deferred `Task`; the rescan runs from there.
+- **Every save of `randomgroup.js` hot-reloads it (autowatch) and wipes
+  its state** - the device stops until it's removed and re-added (or
+  `refresh` is clicked). Don't test while the script is being edited.
+- **Only one `live.remote~` can hold a parameter at a time.** When a
+  track leaves the group, the tracks below it shift into the freed slots,
+  so a slot can be asked to grab a fader another slot still holds - Live
+  refuses that silently. `collectChildren()` therefore releases every
+  changing slot first (`id 0`) and binds in a second pass. Don't merge
+  those loops.
 - **`live.remote~` takes the `id` on its RIGHT inlet**; the left inlet is
   the value (float or signal). Before binding, the script sets the
   channel's `line~` to the right level first so the fader never dips to 0.
@@ -167,8 +195,9 @@ attribute value, but always re-validate structurally afterward.
 
 ## Possible future improvements
 
-- Support more than 8 channels (would need a dynamic/scrollable UI instead
-  of the fixed 8-column grid).
+- More than 16 channels: `NUM_CHANNELS` and `outlets` (2 + 3 per channel)
+  in the script, plus the per-channel objects in the patch, all have to
+  change together - the channel-9-to-16 objects were cloned from channel 8.
 - Per-channel probability weighting instead of (or in addition to) the
   range-based approach.
 - A "lock" per channel to exclude it from auto-balance.
